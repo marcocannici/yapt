@@ -9,6 +9,7 @@ NeptuneLogger
 --------------
 """
 
+import os
 import torch
 from torch import is_tensor
 from typing import Optional, List, Dict, Any, Union, Iterable
@@ -17,8 +18,8 @@ from yapt import _logger as log
 from .base import LoggerBase, rank_zero_only
 
 try:
-    import neptune
-    from neptune.experiments import Experiment
+    import neptune.new as neptune
+    from neptune.new.types import File
 except ImportError:  # pragma: no-cover
     raise ImportError('You want to use `neptune` logger which is not installed yet,'  # pragma: no-cover
                       ' install it with `pip install neptune-client`.')
@@ -32,7 +33,7 @@ except ImportError:  # pragma: no-cover
 class NeptuneLogger(LoggerBase):
     r"""
     Neptune logger can be used in the online mode or offline (silent) mode.
-    To log experiment data in online mode, NeptuneLogger requries an API key:
+    To log experiment data in online mode, NeptuneLogger requires an API key:
     """
 
     def __init__(self,
@@ -41,6 +42,7 @@ class NeptuneLogger(LoggerBase):
                  project_name: Optional[str] = None,
                  close_after_fit: Optional[bool] = True,
                  offline_mode: bool = False,
+                 legacy_types: bool = False,
                  experiment_name: Optional[str] = None,
                  upload_source_files: Optional[List[str]] = None,
                  params: Optional[Dict[str, Any]] = None,
@@ -149,6 +151,10 @@ class NeptuneLogger(LoggerBase):
                You need to create the project in https://neptune.ai first.
             offline_mode: Optional default False. If offline_mode=True no logs will be send
                to neptune. Usually used for debug purposes.
+            legacy_types: Optional default False, If legacy_types=True make scalar types
+                compliant with the legacy Neptune API. Use this if your project contains
+                experiments run with the legacy API and you care about parameters with
+                the same name to be merged into the same column
             close_after_fit: Optional default True. If close_after_fit=False the experiment
                will not be closed after training and additional metrics,
                images or artifacts can be logged. Also, remember to close the experiment explicitly
@@ -180,36 +186,46 @@ class NeptuneLogger(LoggerBase):
                in experiments view as a column.
         """
         super().__init__()
+        self.exp_id = None
         self.api_key = api_key
+        self.legacy_types = legacy_types
         self.project_name = project_name
         self.offline_mode = offline_mode
         self.close_after_fit = close_after_fit
         self.experiment_name = experiment_name
         self.upload_source_files = upload_source_files
-        self.params = params
-        self.properties = properties
+        self.params = params if params is not None else {}
+        self.properties = properties if properties is not None else {}
         self.tags = tags
         self._experiment = None
         self._kwargs = kwargs
 
-        if offline_mode:
-            self.mode = 'offline'
-            neptune.init(project_qualified_name='dry-run/project',
-                         backend=neptune.OfflineBackend())
-        else:
-            self.mode = 'online'
-            neptune.init(api_token=self.api_key,
-                         project_qualified_name=self.project_name)
+        exp_id = None if exp_id == -1 else exp_id
+        self.mode = 'offline' if offline_mode else 'async'
 
+        self._experiment = neptune.init(
+            project=self.project_name,
+            api_token=self.api_key,
+            mode=self.mode,
+            run=exp_id,
+            name=self.experiment_name,
+            tags=self.tags,
+            source_files=self.upload_source_files,
+            **self._kwargs
+        )
         log.info(f'NeptuneLogger was initialized in {self.mode} mode')
 
-        if exp_id is not None and exp_id != -1:
-            project = neptune.Session().get_project(
-                project_qualified_name=self.project_name)
-            self._experiment = project.get_experiments(exp_id)[0]
-        # No lazy init, I need to store the id.
-        self.exp_id = self.experiment.id
-        log.info("Neptune Experiment ID %s" % self.exp_id)
+        if self.mode != "offline":
+            self.exp_id = self._experiment.get_structure()['sys']['id'].fetch()
+            if exp_id is not None and exp_id != self.exp_id:
+                self.finalize()
+                raise RuntimeError(f"Neptune restored an experiment with ID "
+                                   f"({self.exp_id}) different from the "
+                                   f"requested one ({exp_id})!")
+            log.info("Neptune Experiment ID %s" % self.exp_id)
+
+        for key, value in {**self.params, **self.properties}.items():
+            self.set_parameter(key, value)
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -218,7 +234,7 @@ class NeptuneLogger(LoggerBase):
         return state
 
     @property
-    def experiment(self) -> Experiment:
+    def experiment(self) -> neptune.Run:
         r"""
 
         Actual neptune object. To use neptune features do the following.
@@ -228,23 +244,23 @@ class NeptuneLogger(LoggerBase):
             self.logger.experiment.some_neptune_function()
 
         """
-
-        if self._experiment is None:
-            self._experiment = neptune.create_experiment(
-                name=self.experiment_name,
-                params=self.params,
-                properties=self.properties,
-                tags=self.tags,
-                upload_source_files=self.upload_source_files,
-                **self._kwargs)
         return self._experiment
+
+    def _to_legacy_type(self, val: Any) -> Any:
+        if self.legacy_types is False:
+            return val
+        elif isinstance(val, bool):
+            return str(val)
+        elif isinstance(val, int):
+            return float(val)
+        return val
 
     @rank_zero_only
     def log_hyperparams(self, params: Union[Dict[str, Any], Namespace]) -> None:
         params = self._convert_params(params)
         params = self._flatten_dict(params)
         for key, val in params.items():
-            self.experiment.set_property(f'param__{key}', val)
+            self.experiment[f"param__parameters/{key}"] = self._to_legacy_type(val)
 
     @rank_zero_only
     def log_metrics(
@@ -298,9 +314,11 @@ class NeptuneLogger(LoggerBase):
             metric_value = metric_value.cpu().detach()
 
         if step is None:
-            self.experiment.log_metric(metric_name, metric_value)
+            self.experiment[f"logs/{metric_name}"].log(
+                self._to_legacy_type(metric_value))
         else:
-            self.experiment.log_metric(metric_name, x=step, y=metric_value)
+            self.experiment[f"logs/{metric_name}"].log(
+                self._to_legacy_type(metric_value), step=step)
 
     @rank_zero_only
     def log_text(self, log_name: str, text: str, step: Optional[int] = None) -> None:
@@ -332,7 +350,7 @@ class NeptuneLogger(LoggerBase):
                 | Figure from `matplotlib` or `plotly`. If you want to use global figure from `matplotlib`, you
                   can also pass reference to `matplotlib.pyplot` module.
         """
-        api.log_chart(log_name, chart, self.experiment)
+        self.experiment[f"artifacts/charts/{log_name}"].upload(File.as_html(chart))
 
     @rank_zero_only
     def log_image(self, log_name: str, image: Union[str, Any], step: Optional[int] = None) -> None:
@@ -344,7 +362,8 @@ class NeptuneLogger(LoggerBase):
                 Can be one of the following types: PIL image, matplotlib.figure.Figure, path to image file (str)
             step: Step number at which the metrics should be recorded, must be strictly increasing
         """
-        self.experiment.log_image(log_name, image)
+        image = File(image) if isinstance(image, str) else image
+        self.log_metric(log_name, image, step=step)
 
     @rank_zero_only
     def log_artifact(self, artifact: str, destination: Optional[str] = None) -> None:
@@ -355,7 +374,8 @@ class NeptuneLogger(LoggerBase):
             destination: Optional default None. A destination path.
                 If None is passed, an artifact file name will be used.
         """
-        self.experiment.log_artifact(artifact, destination)
+        destination = destination or os.path.basename(artifact)
+        self.experiment[f"artifacts/{destination}"].upload(artifact)
 
     @rank_zero_only
     def set_property(self, key: str, value: Any) -> None:
@@ -365,7 +385,17 @@ class NeptuneLogger(LoggerBase):
             key: Property key.
             value: New value of a property.
         """
-        self.experiment.set_property(key, value)
+        self.experiment[f"properties/{key}"] = self._to_legacy_type(value)
+
+    @rank_zero_only
+    def set_parameter(self, key: str, value: Any) -> None:
+        """Set key-value pair as Neptune experiment parameter.
+
+        Args:
+            key: Property key.
+            value: New value of a property.
+        """
+        self.experiment[f"parameters/{key}"] = self._to_legacy_type(value)
 
     @rank_zero_only
     def append_tags(self, tags: Union[str, Iterable[str]]) -> None:
@@ -376,6 +406,5 @@ class NeptuneLogger(LoggerBase):
                 If multiple - comma separated - str are passed, all of them are added as tags.
                 If list of str is passed, all elements of the list are added as tags.
         """
-        if str(tags) == tags:
-            tags = [tags]  # make it as an iterable is if it is not yet
-        self.experiment.append_tags(*tags)
+        # Handles both single tag and list of tags
+        self.experiment["sys/tags"].add(tags)

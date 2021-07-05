@@ -324,7 +324,6 @@ class BaseTrainer(ABC):
                 api_key=os.environ['NEPTUNE_API_TOKEN'],
                 experiment_name=self.args.exp_name,
                 params=flatten_dict(self.args),
-                logger=self.console_log,
                 upload_source_files=source_files,
                 **(args_neptune))
 
